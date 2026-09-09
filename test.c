@@ -1,8 +1,8 @@
 #include <stdio.h>
 
+static char a[10];
+
 int main()
 {
-    system("bash");
+    write(1, a, 10);
 }
-
-fork()
